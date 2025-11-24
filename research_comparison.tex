@@ -1,0 +1,179 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{titlesec}
+
+\geometry{a4paper, margin=1in}
+
+\title{Comparative Analysis: Stateful Cache-Aware Routing vs. SOTA}
+\author{Project Team}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section*{Executive Summary}
+This report analyzes the current State-of-the-Art (SOTA) in distributed LLM inference caching—specifically \textbf{vLLM}, \textbf{LMcache}, \textbf{llm-d}, and \textbf{SGLang}—and compares them with our proposed \textbf{Stateful Cache-Aware Router with Eviction Callbacks}.
+
+\textbf{Conclusion}: Our project represents a valid and distinct contribution to the field. While existing solutions focus on \textit{local optimization} (vLLM/SGLang) or \textit{data movement} (LMcache), our approach focuses on \textbf{lightweight, consistency-aware routing}. The introduction of ``Push-based Eviction Callbacks'' addresses the ``Stale Cache'' problem in distributed routing without the overhead of distributed storage or heavy orchestration.
+
+\section{State-of-the-Art (SOTA) Analysis}
+
+\subsection{vLLM: The Local Optimization Champion}
+\begin{itemize}
+    \item \textbf{Mechanism}: ``Automatic Prefix Caching'' (APC) using hash-based block matching.
+    \item \textbf{Strengths}: Extremely fast for \textit{local} cache hits. Zero network overhead.
+    \item \textbf{Limitations}: \textbf{Cache Blindness}. In a distributed cluster, Node A does not know what Node B has cached. A standard load balancer might route a request to Node B even if Node A has the hot cache, leading to redundant prefill.
+    \item \textbf{Gap}: Lacks a native distributed routing layer.
+\end{itemize}
+
+\subsection{LMcache: The Storage Disaggregation Approach}
+\begin{itemize}
+    \item \textbf{Mechanism}: Decouples KV cache from compute. Offloads cache to CPU/Disk/Remote (Redis).
+    \item \textbf{Strengths}: Infinite capacity (theoretically). Enables context sharing across sessions.
+    \item \textbf{Limitations}: \textbf{Latency}. Fetching KV cache from remote storage (even over RDMA) incurs network serialization/deserialization costs. For short-to-medium prompts, recomputing might be faster than fetching.
+    \item \textbf{Gap}: Focuses on \textit{moving data to compute}, whereas we focus on \textit{moving compute to data}.
+\end{itemize}
+
+\subsection{llm-d: The Kubernetes Orchestrator}
+\begin{itemize}
+    \item \textbf{Mechanism}: K8s-native scheduler with an ``Inference Gateway''. Tracks pod state to route requests.
+    \item \textbf{Strengths}: Production-ready, integrates with K8s autoscaling.
+    \item \textbf{Limitations}: \textbf{Complexity \& Granularity}. Heavily coupled with Kubernetes. Often relies on polling or coarse-grained metrics.
+    \item \textbf{Gap}: High barrier to entry. May not handle real-time cache eviction events with the same granularity as a direct engine hook.
+\end{itemize}
+
+\subsection{SGLang: The Radix Tree Innovator}
+\begin{itemize}
+    \item \textbf{Mechanism}: RadixAttention (Trie-based) instead of hash blocks.
+    \item \textbf{Strengths}: Handles partial matches and complex branching better than vLLM.
+    \item \textbf{Limitations}: Like vLLM, it is primarily a single-node engine optimization. Distributed SGLang relies on data parallelism but faces the same routing consistency challenges.
+\end{itemize}
+
+\section{Our Contribution: Stateful Router with Eviction Callbacks}
+
+Our system sits as a lightweight middleware layer that bridges the gap between the \textbf{Engine} (vLLM) and the \textbf{Cluster} (Router).
+
+\subsection{The Core Innovation: ``Push-Based Consistency''}
+Most routers use ``Pull'' (polling load) or ``Estimation'' (assuming cache exists). We introduce a \textbf{Push} mechanism:
+\begin{enumerate}
+    \item \textbf{Inference}: Router speculatively updates the map (\texttt{Hash $\rightarrow$ Worker}).
+    \item \textbf{Eviction}: Worker \textit{actively notifies} the router when a block is freed.
+\end{enumerate}
+
+\subsection{Comparative Matrix}
+
+\begin{longtable}{p{3cm} p{2.5cm} p{2.5cm} p{2.5cm} p{3.5cm}}
+\toprule
+\textbf{Feature} & \textbf{vLLM} & \textbf{LMcache} & \textbf{llm-d} & \textbf{Our Solution} \\
+\midrule
+\textbf{Routing Strategy} & Round-Robin & N/A (Storage) & K8s Gateway & \textbf{Sticky-Least-Loaded} \\
+\textbf{Data Locality} & None & Low & High & \textbf{High (Route-to-Data)} \\
+\textbf{State Consistency} & N/A & Strong & Eventual & \textbf{Eventual (Push)} \\
+\textbf{Network Overhead} & Low & High & Medium & \textbf{Very Low} \\
+\textbf{Implementation} & Engine C++ & Middleware & K8s Operator & \textbf{Python Middleware} \\
+\bottomrule
+\end{longtable}
+
+\subsection{Why This is Valid \& Useful}
+\begin{enumerate}
+    \item \textbf{Zero-Copy Efficiency}: Unlike LMcache, we never move the heavy KV cache over the network. We simply route the tiny request to where the cache already lives.
+    \item \textbf{Granular Consistency}: By hooking into \texttt{free\_block}, we get exact visibility into cache lifecycle. If a worker is under memory pressure and evicts a prefix, the router knows immediately and stops sending requests there, preventing ``False Hits''.
+    \item \textbf{Agnostic Design}: Our router is independent of Kubernetes (unlike llm-d) and storage backends (unlike LMcache). It can run on bare metal, Slurm, or Docker Compose.
+\end{enumerate}
+
+\section{Conclusion}
+
+The \textbf{Stateful Cache-Aware Router} is not just a reimplementation of existing tools. It occupies a specific niche: \textbf{optimizing distributed cache hit rates via lightweight coordination}.
+
+It solves the ``Distributed Cache Blindness'' problem of vLLM without incurring the ``Data Movement Latency'' of LMcache or the ``Infrastructure Complexity'' of llm-d. This makes it a highly relevant project for research into efficient LLM serving systems.
+
+\newpage
+\appendix
+\section{Deep Dive: Technical Implementation Details}
+
+This appendix provides a granular analysis of the implementation strategies for the discussed systems, pinpointing specific files and algorithms where possible.
+
+\subsection{vLLM: Automatic Prefix Caching (APC)}
+\textbf{Strategy}: Hash-based block reuse within a single engine instance.
+\begin{itemize}
+    \item \textbf{Key File}: \texttt{vllm/core/block/prefix\_caching\_block.py} (and \texttt{block\_manager.py})
+    \item \textbf{Prefix Caching Algorithm}:
+    \begin{enumerate}
+        \item \textbf{Hashing}: As tokens are processed, vLLM computes a hash of the token sequence in the current block + the hash of the prefix block.
+        \item \textbf{BlockTracker}: Maintains a mapping of \texttt{BlockHash $\rightarrow$ PhysicalBlock}.
+        \item \textbf{Allocation}: When allocating a new block for a sequence, the \texttt{BlockAllocator} checks if a block with the computed hash already exists in the \texttt{FreeList} or \texttt{CachedList}.
+        \item \textbf{Eviction}: Uses an LRU policy. When memory is full, blocks with a reference count of 0 (not currently used by any active sequence) are evicted from the \texttt{CachedList}.
+    \end{enumerate}
+    \item \textbf{Limitation}: The \texttt{BlockTracker} is local to the \texttt{LLMEngine} instance. There is no mechanism to broadcast the existence of a cached block to other workers or a global router.
+\end{itemize}
+
+\subsection{LMcache: Multi-Tier KV Cache Offloading}
+\textbf{Strategy}: Decouple KV cache storage from the compute engine to allow persistence and sharing.
+\begin{itemize}
+    \item \textbf{Key Files}:
+    \begin{itemize}
+        \item \texttt{lmcache/storage\_backend/abstract\_backend.py}: Defines the interface for storage backends.
+        \item \texttt{lmcache/storage\_backend/local\_backend.py}: Implementation for local disk/CPU.
+        \item \texttt{lmcache/storage\_backend/redis\_backend.py}: Implementation for remote Redis storage.
+    \end{itemize}
+    \item \textbf{KV Cache Routing/Storage}:
+    \begin{enumerate}
+        \item \textbf{Connector}: A hook inside the inference engine (e.g., vLLM) intercepts KV cache operations.
+        \item \textbf{Write (Offload)}: Asynchronously writes evicted or completed KV blocks to the configured backend (Redis/Disk).
+        \item \textbf{Read (Prefetch)}: On a cache miss in GPU memory, it queries the backend. If found, it fetches the KV data, deserializes it, and moves it to GPU memory.
+    \end{enumerate}
+    \item \textbf{Latency}: The critical path involves \texttt{GPU $\leftrightarrow$ CPU $\leftrightarrow$ Network $\leftrightarrow$ Remote Storage}. Even with RDMA, this serialization latency often exceeds the compute time for short prefixes.
+\end{itemize}
+
+\subsection{llm-d: Kubernetes-Native Cache-Aware Scheduling}
+\textbf{Strategy}: Intelligent request routing via a K8s Gateway that tracks pod load and cache state.
+\begin{itemize}
+    \item \textbf{Key Component}: \texttt{Endpoint Picker (EPP)} in \texttt{llm-d-inference-scheduler}.
+    \item \textbf{Routing Algorithm}:
+    \begin{enumerate}
+        \item \textbf{Discovery}: Uses K8s API to discover \texttt{vLLM} pods.
+        \item \textbf{State Tracking}: Maintains an in-memory map of which prefixes (or LoRA adapters) are active on which pods. This is often updated via piggybacked metrics or polling.
+        \item \textbf{Scoring}: Incoming requests are scored against available pods.
+        \[ Score(pod) = w_1 \cdot \text{CacheHit} + w_2 \cdot (1 - \text{Load}) \]
+        \item \textbf{Dispatch}: The request is routed to the pod with the highest score.
+    \end{enumerate}
+    \item \textbf{Complexity}: Requires deploying a custom K8s Controller, Gateway API, and specialized sidecars.
+\end{itemize}
+
+\subsection{SGLang: RadixAttention}
+\textbf{Strategy}: Tree-based cache management instead of hash-based blocks.
+\begin{itemize}
+    \item \textbf{Key File}: \texttt{python/sglang/srt/managers/radix\_attention.py}
+    \item \textbf{Algorithm}:
+    \begin{enumerate}
+        \item \textbf{Radix Tree}: Maintains a CPU-side Radix Tree where edges are token sequences and nodes map to GPU memory indices.
+        \item \textbf{Prefix Matching}: Unlike vLLM's block hash (which requires exact block alignment), SGLang can match partial prefixes of arbitrary length by traversing the tree.
+        \item \textbf{Eviction}: LRU eviction is performed on leaf nodes of the Radix Tree.
+    \end{enumerate}
+    \item \textbf{Benefit}: Higher hit rate for dynamic system prompts or multi-turn conversations where the shared prefix might not align perfectly with block boundaries.
+\end{itemize}
+
+\subsection{Sarathi-Serve: Chunked Prefills & Stall-Free Scheduling}
+\textbf{Strategy}: Optimize throughput-latency trade-off by splitting prefill phases.
+\begin{itemize}
+    \item \textbf{Key Concept}: \textbf{Chunked Prefills}.
+    \item \textbf{Algorithm}:
+    \begin{enumerate}
+        \item \textbf{Split}: A long prefill request is split into smaller chunks (e.g., 512 tokens).
+        \item \textbf{Schedule}: The scheduler creates "Hybrid Batches" containing a mix of:
+        \begin{itemize}
+            \item Decode tokens from ongoing requests.
+            \item One or more prefill chunks from new requests.
+        \end{itemize}
+        \item \textbf{Stall-Free}: By limiting the size of the prefill chunk, the system ensures that the "Time Between Tokens" (TBT) for the decode requests remains low, avoiding the "head-of-line blocking" problem typical of FCFS schedulers.
+    \end{enumerate}
+    \item \textbf{Relevance}: While Sarathi focuses on \textit{single-node scheduling efficiency}, our project focuses on \textit{multi-node routing efficiency}. The two are complementary.
+\end{itemize}
+
+\end{document}
