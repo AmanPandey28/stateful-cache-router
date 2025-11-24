@@ -11,3 +11,6 @@ __pycache__/
 .idea/
 venv/
 .DS_Store
+
+# LaTeX source files (keep only PDFs)
+*.tex
