@@ -1,5 +1,7 @@
 from typing import List, Dict, Set
 import threading
+import logging
+logger = logging.getLogger("Router")
 import time
 
 class GlobalCacheMap:
@@ -43,17 +45,24 @@ class GlobalCacheMap:
         Replace the router's view of this worker's cache with the provided list.
         """
         with self._lock:
+            logger.info(f"[SYNC DEBUG] Starting sync for {worker_id}, active_hashes={len(active_hashes)}")
+            logger.info(f"[SYNC DEBUG] Current map state: {dict(self._map)}")
+            
             # 1. Remove worker from all current entries using Reverse Index
             # This is now O(M) where M is the number of hashes THIS worker has, not total hashes.
             if worker_id in self._worker_to_hashes:
                 current_hashes = list(self._worker_to_hashes[worker_id])
+                logger.info(f"[SYNC DEBUG] Clearing {len(current_hashes)} old hashes for {worker_id}: {current_hashes}")
                 for h in current_hashes:
                     if h in self._map:
                         self._map[h].discard(worker_id)
                         if not self._map[h]:
                             del self._map[h]
+                            logger.info(f"[SYNC DEBUG] Deleted hash {h[:8]}... from map (no workers left)")
                 # Clear reverse map for this worker
                 self._worker_to_hashes[worker_id].clear()
+            else:
+                logger.info(f"[SYNC DEBUG] Worker {worker_id} not in reverse map")
             
             # 2. Add worker to new active entries
             for h in active_hashes:
@@ -64,6 +73,8 @@ class GlobalCacheMap:
                 if worker_id not in self._worker_to_hashes:
                     self._worker_to_hashes[worker_id] = set()
                 self._worker_to_hashes[worker_id].add(h)
+            
+            logger.info(f"[SYNC DEBUG] After sync, map state: {dict(self._map)}")
             
             # Update liveness
             self._worker_load[worker_id] = self._worker_load.get(worker_id, 0)
