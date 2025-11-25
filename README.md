@@ -189,8 +189,9 @@ See `docs/report.pdf` for the detailed technical report.
 ```bibtex
 @misc{stateful-cache-router,
   title={Stateful Cache-Aware Routing for Distributed LLM Inference},
-  author={Pandey, Aman and Kumar, Sanjeev and Khanolkar, Aryan and Avula, Guna},
+  author={Kumar Sanjeev, Aman Pandey and Khanolkar, Aryan and Avula, Guna},
   year={2025},
   institution={Purdue University}
 }
 ```
+
