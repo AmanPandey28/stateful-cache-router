@@ -5,6 +5,7 @@ import uvicorn
 import logging
 import os
 import httpx
+import threading
 
 from .tokenizer_utils import TokenizerUtils
 from .cache_map import GlobalCacheMap
@@ -18,9 +19,14 @@ logger = logging.getLogger("Router")
 
 # Environment configuration
 PROXY_MODE = os.getenv("PROXY_MODE", "false").lower() == "true"
+ROUTING_STRATEGY = os.getenv("ROUTING_STRATEGY", "cache_aware").lower()  # cache_aware, round_robin, least_loaded
 WORKER_URLS = {}  # Will be populated via heartbeat: {worker_id: base_url}
 
 app = FastAPI(title="Stateful Cache-Aware Router")
+
+# Round-robin state
+round_robin_index = 0
+round_robin_lock = threading.Lock()
 
 # Global instances
 tokenizer_utils = TokenizerUtils() # Defaults to gpt2 for demo
@@ -40,38 +46,69 @@ class Heartbeat(BaseModel):
     current_load: int
     worker_url: Optional[str] = None  # Base URL for proxy mode
 
+def route_round_robin() -> Optional[str]:
+    """Round-robin routing: cycle through workers."""
+    global round_robin_index
+    with round_robin_lock:
+        workers = list(cache_map._worker_load.keys())
+        if not workers:
+            return None
+        worker = workers[round_robin_index % len(workers)]
+        round_robin_index += 1
+        return worker
+
 @app.post("/v1/completions")
 async def generate(request: InferenceRequest):
     """
     Simulated inference endpoint.
-    In a real system, this would proxy to the chosen vLLM worker.
+    Supports multiple routing strategies: cache_aware, round_robin, least_loaded
     """
-    # 1. Compute Prefix Hash
-    # Use explicit prefix_len if provided, otherwise use a smart default (e.g., 64 tokens)
-    # This prevents "Whole Prompt Hashing" which kills cache hit rates for Chat/RAG.
-    effective_prefix_len = request.prefix_len if request.prefix_len is not None else 64
-    prefix_hash = tokenizer_utils.compute_prefix_hash(request.prompt, effective_prefix_len)
-    
-    # 2. Query Cache Map
-    candidates = cache_map.get_workers_for_prefix(prefix_hash)
+    # 1. Compute block hashes for the prompt
+    block_hashes = tokenizer_utils.compute_block_hashes(request.prompt)
     
     target_worker = None
+    match_length = 0
     cache_status = "MISS"
     
-    if candidates:
-        # HIT: Route to least loaded among candidates
-        target_worker = cache_map.get_least_loaded_worker(candidates)
-        cache_status = "HIT"
-        logger.info(f"🎯 Cache HIT for hash {prefix_hash[:8]}... -> Routing to {target_worker}")
-    else:
-        # MISS: Route to globally least loaded
-        target_worker = cache_map.get_least_loaded_worker()
-        logger.info(f"❌ Cache MISS for hash {prefix_hash[:8]}... -> Routing to {target_worker}")
+    # Route based on strategy
+    if ROUTING_STRATEGY == "round_robin":
+        # Round-robin: ignore cache, just cycle through workers
+        target_worker = route_round_robin()
+        logger.info(f"🔄 Round-Robin: Routing to {target_worker}")
         
+    elif ROUTING_STRATEGY == "least_loaded":
+        # Least-loaded: ignore cache, pick least loaded worker
+        target_worker = cache_map.get_least_loaded_worker()
+        # Speculatively increase load (will be corrected by next heartbeat)
         if target_worker:
-            # Speculatively update map (assuming worker will cache it)
-            cache_map.update(target_worker, prefix_hash)
-            logger.info(f"📝 Speculatively cached {prefix_hash[:8]}... on {target_worker}")
+            current_load = cache_map._worker_load.get(target_worker, 0)
+            # Estimate: add ~50ms per request (rough estimate)
+            cache_map.update_load(target_worker, current_load + 50)
+        logger.info(f"⚖️  Least-Loaded: Routing to {target_worker} (load={cache_map._worker_load.get(target_worker, 0)})")
+        
+    else:  # cache_aware (default)
+        # 2. Find worker with longest prefix match using prefix tree
+        target_worker, match_length = cache_map.find_longest_prefix_match(block_hashes)
+        
+        if target_worker and match_length > 0:
+            # HIT: Found a worker with matching prefix blocks
+            cache_status = "HIT"
+            logger.info(
+                f"🎯 Cache HIT: {match_length}/{len(block_hashes)} blocks matched "
+                f"-> Routing to {target_worker}"
+            )
+        else:
+            # MISS: No matching prefix found, route to least loaded worker
+            target_worker = cache_map.get_least_loaded_worker()
+            logger.info(
+                f"❌ Cache MISS: 0/{len(block_hashes)} blocks matched "
+                f"-> Routing to {target_worker}"
+            )
+            
+            if target_worker and block_hashes:
+                # Speculatively update map with block sequence (assuming worker will cache it)
+                cache_map.update_block_sequence(target_worker, block_hashes)
+                logger.info(f"📝 Speculatively cached {len(block_hashes)} blocks on {target_worker}")
 
     if not target_worker:
         raise HTTPException(status_code=503, detail="No workers available")
@@ -97,7 +134,8 @@ async def generate(request: InferenceRequest):
         return {
             "assigned_worker": target_worker,
             "status": "forwarded",
-            "prefix_hash": prefix_hash,
+            "block_hashes": block_hashes,
+            "match_length": match_length if cache_status == "HIT" else 0,
             "cache_status": cache_status
         }
 

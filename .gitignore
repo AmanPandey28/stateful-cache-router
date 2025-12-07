@@ -10,6 +10,47 @@ __pycache__/
 .vscode/
 .idea/
 venv/
+.venv/
 .DS_Store
+
+# Result files
+*.json
+!package.json
+!package-lock.json
+results_*.json
+strategy_comparison*.json
+dashboard_results.json
+metrics.json
+baseline_results.json
+comparison_results.json
+prefix_length_results.json
+
+# Generated plots/images
+*.png
+*.jpg
+*.jpeg
+*.pdf
+!docs/*.pdf
+
+# Python cache
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 
